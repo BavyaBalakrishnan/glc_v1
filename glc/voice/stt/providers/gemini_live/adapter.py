@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ssl
 import time
 from typing import Any
 
@@ -64,20 +65,16 @@ class Provider(STTProvider):
         """
         model = self.config.get("model", _DEFAULT_MODEL)
         # gemini-3.1-flash-live-preview only supports AUDIO responseModalities.
-        # TEXT modality is rejected by this model (1007 error).
-        # inputAudioTranscription: {} is also rejected by the current API (1007).
-        # Strategy: use outputAudioTranscription to get a text transcript of the
-        # model's AUDIO reply. A systemInstruction tells the model to repeat
-        # the user's words verbatim, so the output transcript == the input STT.
+        # inputAudioTranscription is rejected by the current API (1007 error).
+        # Workaround: use outputAudioTranscription to get a text transcript of
+        # the model's AUDIO reply. A systemInstruction tells the model to repeat
+        # the user's words verbatim, so outputTranscription == input speech.
         modalities = self.config.get("response_modalities", ["AUDIO"])
         return {
             "setup": {
                 "model": model,
                 "generationConfig": {"responseModalities": modalities},
-                # Enable text transcription of the model's audio output.
                 "outputAudioTranscription": {},
-                # Instruct the model to act as a transcriber: repeat exactly
-                # what the user says so outputTranscription == the input speech.
                 "systemInstruction": {
                     "parts": [{
                         "text": (
@@ -94,15 +91,11 @@ class Provider(STTProvider):
     def _build_audio_frame(self, audio: bytes, mime: str) -> dict[str, Any]:
         """The realtimeInput frame carrying the (base64) audio payload.
 
-        Gemini Live requires raw PCM data (not WAV). If the caller passes
-        a WAV file (detected by the 'RIFF' header), we strip the 44-byte
-        header to extract the raw PCM payload before encoding.
-
-        Note: ``mediaChunks`` is deprecated by the API; the ``audio`` field
-        is the current supported format for audio input.
+        Gemini Live requires raw PCM (not a WAV container). If the caller
+        passes WAV bytes (detected by the 'RIFF' magic header), the 44-byte
+        header is stripped automatically before encoding.
         """
-        # Strip WAV container header if present — Gemini Live expects raw PCM.
-        # WAV files start with the 4-byte ASCII magic 'RIFF'.
+        # Strip WAV container header if present — Gemini Live rejects it.
         _WAV_HEADER_BYTES = 44
         if audio[:4] == b"RIFF":
             audio = audio[_WAV_HEADER_BYTES:]
@@ -139,17 +132,16 @@ class Provider(STTProvider):
         Flow (per https://ai.google.dev/api/multimodal-live):
 
           1. Open ``{_WS_ENDPOINT}?key=$GEMINI_API_KEY``.
-          2. Send the setup frame FIRST (includes systemInstruction and
-             outputAudioTranscription to enable text transcript of the reply).
+          2. Send the setup frame FIRST (includes outputAudioTranscription
+             and systemInstruction to transcribe the reply verbatim).
           3. Send the audio as a ``realtimeInput.audio`` frame with raw PCM
              at 16 kHz (WAV header stripped if present), then signal
              ``audioStreamEnd`` so the server closes the input turn.
           4. Read messages, accumulating text from
-             ``serverContent.outputTranscription.text`` (preferred — arrives
-             alongside each audio chunk when outputAudioTranscription is set).
-             Fall back to ``inputTranscription`` or ``modelTurn.parts[].text``
-             if available. Ignore ``setupComplete`` / ``usageMetadata`` /
-             ``sessionResumptionUpdate`` frames. Stop on ``turnComplete``.
+             ``serverContent.outputTranscription.text`` (primary), falling
+             back to ``inputTranscription`` or ``modelTurn.parts[].text``.
+             Ignore ``setupComplete`` / ``usageMetadata`` frames. Stop on
+             ``serverContent.turnComplete``.
           5. Wrap any failure in ``STTError``.
 
         Requires ``GEMINI_API_KEY`` in the environment (or ``config``).
@@ -167,14 +159,27 @@ class Provider(STTProvider):
         start = time.monotonic()
         transcript: list[str] = []
 
+        # Allow disabling SSL verification for corporate proxies that inject
+        # non-standard CA certificates (set config["ssl_verify"] = False).
+        ssl_ctx: ssl.SSLContext | bool = True
+        if self.config.get("ssl_verify") is False:
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+
         try:
-            async with websockets.connect(url, max_size=None) as ws:
+            async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as ws:
                 # 1. setup must be the first frame
                 await ws.send(json.dumps(self._build_setup_frame()))
                 # 2. push the audio, then close the input turn
                 await ws.send(json.dumps(self._build_audio_frame(audio, mime)))
                 await ws.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
-                # 3. drain responses until the turn completes
+                # 3. drain responses until the turn completes.
+                # Lock onto the first field that produces text and ignore all
+                # others for the rest of the session — prevents the same
+                # sentence appearing twice when both outputTranscription and
+                # modelTurn fire in separate messages.
+                preferred_source: str | None = None
                 async for raw in ws:
                     data = json.loads(raw)
                     server_content = data.get("serverContent")
@@ -182,25 +187,26 @@ class Provider(STTProvider):
                         # Skip non-content frames: setupComplete, usageMetadata,
                         # sessionResumptionUpdate, etc.
                         continue
-                    # Primary path: outputTranscription is populated when
-                    # outputAudioTranscription is enabled in the setup frame.
-                    # It carries the text transcript of the model's audio reply
-                    # in chunks alongside each audio inlineData part.
                     output_tx = server_content.get("outputTranscription")
-                    if output_tx and output_tx.get("text"):
-                        transcript.append(output_tx["text"])
-                    # Legacy fallback: inputTranscription (if API ever enables it).
                     input_tx = server_content.get("inputTranscription")
-                    if input_tx and input_tx.get("text"):
-                        transcript.append(input_tx["text"])
-                    # Further fallback: text parts in the model turn (not present
-                    # when responseModalities is AUDIO-only, but kept for safety).
                     model_turn = server_content.get("modelTurn")
-                    if model_turn:
+
+                    if output_tx and output_tx.get("text"):
+                        preferred_source = preferred_source or "outputTranscription"
+                        if preferred_source == "outputTranscription":
+                            transcript.append(output_tx["text"])
+                    elif input_tx and input_tx.get("text"):
+                        preferred_source = preferred_source or "inputTranscription"
+                        if preferred_source == "inputTranscription":
+                            transcript.append(input_tx["text"])
+                    elif model_turn and preferred_source is None:
                         for part in model_turn.get("parts", []):
                             text = part.get("text")
                             if text:
                                 transcript.append(text)
+                        if transcript:
+                            preferred_source = "modelTurn"
+
                     if server_content.get("turnComplete"):
                         break
         except STTError:
