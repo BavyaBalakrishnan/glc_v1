@@ -112,16 +112,12 @@ class Provider(STTProvider):
             mime = PCM_MIME_TYPE
         encoded = base64.b64encode(audio).decode("ascii")
         payload = GeminiLiveAudioFrame(
-            realtimeInput=GeminiLiveRealtimeInput(
-                audio=GeminiLiveAudioInput(mimeType=mime, data=encoded)
-            )
+            realtimeInput=GeminiLiveRealtimeInput(audio=GeminiLiveAudioInput(mimeType=mime, data=encoded))
         )
         return payload.model_dump(by_alias=True)
 
     # ── mock path (what CI exercises) ──────────────────────────────
-    async def _transcribe_via_mock(
-        self, mock: Any, audio: bytes, mime: str
-    ) -> TranscribeResult:
+    async def _transcribe_via_mock(self, mock: Any, audio: bytes, mime: str) -> TranscribeResult:
         """Drive the in-repo fake upstream.
 
         Order matters: the setup frame is recorded before the audio frame
@@ -135,9 +131,7 @@ class Provider(STTProvider):
         return await mock.transcribe(audio, mime)
 
     # ── real path (for the demo; not run by CI) ────────────────────
-    async def _transcribe_via_websocket(
-        self, audio: bytes, mime: str
-    ) -> TranscribeResult:
+    async def _transcribe_via_websocket(self, audio: bytes, mime: str) -> TranscribeResult:
         """Real Gemini Live call over the BidiGenerateContent WebSocket.
 
         Flow (per https://ai.google.dev/api/multimodal-live):

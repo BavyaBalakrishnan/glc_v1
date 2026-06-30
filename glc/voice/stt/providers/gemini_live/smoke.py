@@ -57,10 +57,7 @@ def _load_api_key() -> str:
                 os.environ.setdefault(key.strip(), value.strip())
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key or "your-gemini" in api_key:
-        sys.exit(
-            "GEMINI_API_KEY is not set. Export it or add it to "
-            f"{_ENV_FILE} (this file is gitignored)."
-        )
+        sys.exit(f"GEMINI_API_KEY is not set. Export it or add it to {_ENV_FILE} (this file is gitignored).")
     return api_key
 
 
@@ -78,10 +75,7 @@ def _read_wav_pcm(path: Path) -> bytes:
 def _synthesize_pcm(phrase: str) -> bytes:
     """Synthesise ``phrase`` to 16 kHz mono PCM via macOS ``say``/``afconvert``."""
     if not (shutil.which("say") and shutil.which("afconvert")):
-        sys.exit(
-            "macOS 'say'/'afconvert' not found. Pass --wav with a "
-            "16 kHz mono WAV file instead."
-        )
+        sys.exit("macOS 'say'/'afconvert' not found. Pass --wav with a 16 kHz mono WAV file instead.")
     aiff = _PROVIDER_DIR / "_smoke_say.aiff"
     wav = _PROVIDER_DIR / "_smoke_say.wav"
     try:
