@@ -15,6 +15,7 @@ Usage (from the repo root)::
     uv run python -m glc.voice.stt.providers.gemini_live.smoke
     uv run python -m glc.voice.stt.providers.gemini_live.smoke "Custom phrase"
     uv run python -m glc.voice.stt.providers.gemini_live.smoke --wav path/to/16k_mono.wav
+    uv run python -m glc.voice.stt.providers.gemini_live.smoke --mic --seconds 5
 
 The API key is read from the environment, falling back to a ``.env`` file in
 this provider folder (``GEMINI_API_KEY=...``). The ``.env`` is gitignored.
@@ -23,6 +24,9 @@ Audio source:
   * Default: synthesise the phrase with macOS ``say`` + ``afconvert`` into
     16 kHz mono PCM.
   * ``--wav``: read an existing 16 kHz mono WAV file instead (works on any OS).
+  * ``--mic``: prompt you to speak and record live from the microphone. Needs
+    the optional ``sounddevice`` package (``uv pip install sounddevice``); it
+    is intentionally not a project dependency.
 
 Exit code is ``0`` on a successful, non-duplicated transcript and non-zero
 otherwise, so it can double as a simple smoke gate in a manual checklist.
@@ -45,6 +49,8 @@ _PROVIDER_DIR = Path(__file__).resolve().parent
 _ENV_FILE = _PROVIDER_DIR / ".env"
 _DEFAULT_PHRASE = "Hello, this is a Gemini Live smoke test."
 _PCM_MIME = "audio/pcm;rate=16000"
+_SAMPLE_RATE = 16000
+_DEFAULT_MIC_SECONDS = 5
 
 
 def _load_api_key() -> str:
@@ -90,6 +96,28 @@ def _synthesize_pcm(phrase: str) -> bytes:
         wav.unlink(missing_ok=True)
 
 
+def _record_mic(seconds: int) -> bytes:
+    """Prompt the user to speak, record ``seconds`` of 16 kHz mono PCM.
+
+    ``sounddevice`` is imported lazily so it stays an optional extra (it is
+    deliberately not a project dependency). Install it locally with
+    ``uv pip install sounddevice`` to use ``--mic``.
+    """
+    try:
+        import sounddevice as sd
+    except ImportError:
+        sys.exit(
+            "The 'sounddevice' package is required for --mic. "
+            "Install it locally with: uv pip install sounddevice"
+        )
+    input(f"Press Enter, then speak for {seconds} seconds... ")
+    print("🎤 Recording — speak now!")
+    frames = sd.rec(int(seconds * _SAMPLE_RATE), samplerate=_SAMPLE_RATE, channels=1, dtype="int16")
+    sd.wait()
+    print("✅ Done recording. Sending to Gemini Live...")
+    return bytes(frames.tobytes())
+
+
 def _looks_duplicated(text: str) -> bool:
     """Heuristic: detect the old bug where the sentence was emitted twice."""
     cleaned = text.strip().rstrip(".")
@@ -118,11 +146,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Gemini Live STT real-API smoke runner.")
     parser.add_argument("phrase", nargs="*", help="phrase to synthesise and transcribe")
     parser.add_argument("--wav", type=Path, help="use this 16 kHz mono WAV instead of 'say'")
+    parser.add_argument("--mic", action="store_true", help="record from the microphone and transcribe")
+    parser.add_argument(
+        "--seconds", type=int, default=_DEFAULT_MIC_SECONDS, help="seconds to record with --mic"
+    )
     args = parser.parse_args(argv)
 
     _load_api_key()
 
-    if args.wav:
+    if args.mic:
+        audio = _record_mic(args.seconds)
+        source = f"mic: {args.seconds}s"
+    elif args.wav:
         audio = _read_wav_pcm(args.wav)
         source = str(args.wav)
     else:
