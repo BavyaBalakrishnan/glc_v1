@@ -1,1 +1,1 @@
-"""Gemini Live WebSocket STT (stub)."""
+"""Gemini Live WebSocket STT provider."""
